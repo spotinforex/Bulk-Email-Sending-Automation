@@ -1,0 +1,6 @@
+.venv/
+.env
+*.xlsx
+logs/
+attachments/
+output/
