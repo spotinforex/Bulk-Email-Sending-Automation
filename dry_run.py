@@ -11,6 +11,7 @@ Usage:
 import argparse
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import dns.resolver
@@ -42,13 +43,26 @@ def derive_certificate_name(status_report_name: str) -> str:
 
 def run(args):
     attachments_dir = Path(args.attachments)
+    output_dir = Path(args.output)
+    output_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    txt_path = output_dir / f"dry_run_{timestamp}.txt"
+
     df = pd.read_excel(args.dataset, dtype=str).fillna("")
     df.columns = [c.strip() for c in df.columns]
 
-    print(f"\n{'='*70}")
-    print(f"  DRY RUN — {args.dataset}  ({len(df)} rows)")
-    print(f"  Attachments dir: {attachments_dir.resolve()}")
-    print(f"{'='*70}\n")
+    lines = []
+
+    def emit(line: str = ""):
+        """Print to console and buffer for file."""
+        print(line)
+        lines.append(line)
+
+    emit(f"\n{'='*70}")
+    emit(f"  DRY RUN — {args.dataset}  ({len(df)} rows)")
+    emit(f"  Attachments dir: {attachments_dir.resolve()}")
+    emit(f"{'='*70}\n")
 
     issues = []
     rows_ok = 0
@@ -87,18 +101,24 @@ def run(args):
         if row_issues:
             issues.append((row_num, name, biz, row_issues))
             for issue in row_issues:
-                print(f"  [ROW {row_num:>4}] {name:<30} | {issue}")
+                emit(f"  [ROW {row_num:>4}] {name:<30} | {issue}")
         else:
             cert_name = derive_certificate_name(src_file)
-            print(
-                f"  [ROW {row_num:>4}] ✓  {name:<28}  "
-                f"{email}  →  {cert_name}"
+            emit(
+                f"  [ROW {row_num:>4}] OK  {name:<28}  "
+                f"{email}  ->  {cert_name}"
             )
             rows_ok += 1
 
-    print(f"\n{'='*70}")
-    print(f"  SUMMARY: {rows_ok} OK  |  {len(issues)} with issues")
-    print(f"{'='*70}\n")
+    emit(f"\n{'='*70}")
+    emit(f"  SUMMARY: {rows_ok} OK  |  {len(issues)} with issues")
+    emit(f"{'='*70}\n")
+
+    # Write everything to the txt file
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"  Results saved -> {txt_path}")
 
     if issues:
         sys.exit(1)
@@ -108,6 +128,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Dry-run validation before sending")
     p.add_argument("--dataset",     required=True)
     p.add_argument("--attachments", default="attachments")
+    p.add_argument("--output",      default="output", help="Dir to save dry run result txt")
     return p.parse_args()
 
 

