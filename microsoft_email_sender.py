@@ -7,6 +7,17 @@ filenames, attaches both files, sends in batches, and logs all results.
 Uses Microsoft Graph API with OAuth 2.0 Device Code Flow (delegated,
 Mail.Send permission — no admin consent required).
 
+Single master log
+-----------------
+Every run appends to ONE file: <output>/master_results.txt (plus an Excel
+view, master_results.xlsx, rebuilt at the end of each run). On startup the
+script reads the master file and skips anyone already marked "sent", so no
+--resume argument is needed.
+
+If the master file doesn't exist yet but old results_*.txt files are found in
+the output folder, their "sent" rows are merged into a new master automatically
+(one-time migration).
+
 Setup
 -----
 1. Register an app in Azure Active Directory (Entra ID).
@@ -36,7 +47,6 @@ Usage:
         --batch-size 10 \
         --batch-delay 60 \
         --send-delay 3 \
-        --resume output/results_20260509_143022.txt \
         --session-limit 100
 """
 
@@ -65,7 +75,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / f"email_run_{timestamp}.log"),
+        logging.FileHandler(LOG_DIR / f"email_run_{timestamp}.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -80,6 +90,9 @@ GRAPH_TOKEN_URL       = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2
 GRAPH_SEND_URL        = "https://graph.microsoft.com/v1.0/me/sendMail"
 GRAPH_SCOPE           = "https://graph.microsoft.com/Mail.Send offline_access"
 TOKEN_CACHE_PATH      = Path.home() / ".graph_token_cache.json"
+
+# ── Master log name ───────────────────────────────────────────────────────────
+MASTER_LOG_NAME = "master_results"
 
 # ── Retry decorator ───────────────────────────────────────────────────────────
 
@@ -239,29 +252,24 @@ class GraphTokenManager:
         except Exception as e:
             log.warning("Could not load token cache (%s) — will re-authenticate.", e)
 
-# ── Resume: load already-sent emails from previous result files ───────────────
+# ── Master log: load already-sent emails ──────────────────────────────────────
 
-def load_sent_emails(log_files: list[str]) -> set[str]:
+def load_sent_emails(master_path: Path) -> set[str]:
+    """Return the set of emails marked 'sent' in the master results file."""
     already_sent: set[str] = set()
-    if not log_files:
+    if not master_path.exists():
+        log.info("No master log yet (%s) — nobody will be skipped.", master_path)
         return already_sent
-    for log_file in log_files:
-        path = Path(log_file)
-        if not path.exists():
-            log.warning("Resume file not found, skipping: %s", log_file)
-            continue
-        count_before = len(already_sent)
-        try:
-            df = pd.read_csv(path, sep="\t", dtype=str).fillna("")
-            sent_rows = df[df["result"].str.strip().str.lower() == "sent"]
-            emails = {e.strip().lower() for e in sent_rows["email"] if e.strip()}
-            already_sent.update(emails)
-            log.info("Resume — %s: %d sent emails loaded (%d sent rows found)",
-                     path.name, len(already_sent) - count_before, len(sent_rows))
-        except Exception as e:
-            log.error("Could not read resume file %s: %s", log_file, e)
-    log.info("Resume total: %d unique already-sent emails across %d file(s) — "
-             "these will be skipped.", len(already_sent), len(log_files))
+    try:
+        df = pd.read_csv(master_path, sep="\t", dtype=str).fillna("")
+        sent_rows = df[df["result"].str.strip().str.lower() == "sent"]
+        already_sent = {e.strip().lower() for e in sent_rows["email"] if e.strip()}
+        log.info("Master log: %d unique already-sent emails loaded from %s "
+                 "— these will be skipped.", len(already_sent), master_path.name)
+    except Exception as e:
+        # Fail loudly: continuing with an empty set could cause duplicate sends.
+        log.error("Could not read master log %s: %s", master_path, e)
+        raise
     return already_sent
 
 # ── Email validation ──────────────────────────────────────────────────────────
@@ -382,35 +390,75 @@ MCIPP
 
     return {"message": message, "saveToSentItems": "true"}
 
-# ── Result tracking ───────────────────────────────────────────────────────────
+# ── Result tracking (single master file) ──────────────────────────────────────
 
 class ResultTracker:
     COLUMNS = [
-        "timestamp", "row_index", "surname", "firstname",
+        "timestamp", "run_id", "row_index", "surname", "firstname",
         "email", "business_name", "status_report_file",
         "certificate_file", "result", "reason",
     ]
 
     def __init__(self, output_dir: Path):
         output_dir.mkdir(exist_ok=True)
-        self.log_path  = output_dir / f"results_{timestamp}.txt"
-        self.xlsx_path = output_dir / f"results_{timestamp}.xlsx"
-        self.records: list[dict] = []
+        self.output_dir = output_dir
+        self.log_path   = output_dir / f"{MASTER_LOG_NAME}.txt"
+        self.xlsx_path  = output_dir / f"{MASTER_LOG_NAME}.xlsx"
+        self.records: list[dict] = []   # this run only (for the summary)
 
-        with open(self.log_path, "w") as f:
-            f.write("\t".join(self.COLUMNS) + "\n")
+        if not self.log_path.exists() or self.log_path.stat().st_size == 0:
+            if not self._migrate_old_results():
+                with open(self.log_path, "w", encoding="utf-8") as f:
+                    f.write("\t".join(self.COLUMNS) + "\n")
+
+    def _migrate_old_results(self) -> bool:
+        """
+        One-time: fold 'sent' rows from legacy results_*.txt files into a new
+        master file. Returns True if a master was created.
+        """
+        old_files = sorted(self.output_dir.glob("results_*.txt"))
+        if not old_files:
+            return False
+
+        frames = []
+        for f in old_files:
+            try:
+                frames.append(pd.read_csv(f, sep="\t", dtype=str).fillna(""))
+            except Exception as e:
+                log.warning("Migration: could not read %s (%s) — skipped.", f.name, e)
+        if not frames:
+            return False
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df[df["result"].str.strip().str.lower() == "sent"].copy()
+        df["_e"] = df["email"].str.strip().str.lower()
+        df = df.drop_duplicates("_e").drop(columns="_e")
+        df["run_id"] = "migrated"
+        df = df.reindex(columns=self.COLUMNS).fillna("")
+        df.to_csv(self.log_path, sep="\t", index=False, encoding="utf-8")
+        log.info("Migration: created master log with %d sent records from %d old file(s).",
+                 len(df), len(old_files))
+        return True
 
     def record(self, **kwargs):
         kwargs.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
+        kwargs["run_id"] = timestamp
         self.records.append(kwargs)
-        with open(self.log_path, "a") as f:
-            row = "\t".join(str(kwargs.get(c, "")) for c in self.COLUMNS)
+        # Strip tabs/newlines so error messages can't corrupt the TSV rows
+        row = "\t".join(
+            re.sub(r"[\t\r\n]+", " ", str(kwargs.get(c, ""))) for c in self.COLUMNS
+        )
+        with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(row + "\n")
 
     def save_excel(self):
-        df = pd.DataFrame(self.records, columns=self.COLUMNS)
-        df.to_excel(self.xlsx_path, index=False)
-        log.info("Excel results saved -> %s", self.xlsx_path)
+        """Rebuild the Excel view from the full master file (all runs)."""
+        try:
+            df = pd.read_csv(self.log_path, sep="\t", dtype=str).fillna("")
+            df.to_excel(self.xlsx_path, index=False)
+            log.info("Excel master saved -> %s (%d total rows)", self.xlsx_path, len(df))
+        except PermissionError:
+            log.warning("Close %s in Excel, then rerun to refresh it.", self.xlsx_path)
 
     def summary(self):
         counts: dict[str, int] = {}
@@ -440,7 +488,7 @@ def run(args):
     output_dir      = Path(args.output)
     tracker         = ResultTracker(output_dir)
 
-    already_sent  = load_sent_emails(args.resume or [])
+    already_sent  = load_sent_emails(tracker.log_path)
     session_limit = args.session_limit
     session_sent  = 0
 
@@ -499,15 +547,10 @@ def run(args):
                 skipped += 1
                 continue
 
+            # Already sent in a previous run (per master log) — skip silently,
+            # without writing another row, so the master doesn't keep growing.
             if email_raw.lower() in already_sent:
-                log.info("Row %d: %s already sent in a previous run — skipping",
-                         row_num, email_raw)
-                tracker.record(
-                    row_index=row_num, surname=surname, firstname=firstname,
-                    email=email_raw, business_name=biz_name,
-                    status_report_file=src_file, certificate_file="",
-                    result="resumed", reason="already_sent_previous_run",
-                )
+                log.info("Row %d: %s already sent — skipping", row_num, email_raw)
                 resumed += 1
                 continue
 
@@ -564,6 +607,8 @@ def run(args):
                 )
                 sent += 1
                 session_sent += 1
+                # Also guard against the same email appearing twice in the dataset
+                already_sent.add(email_raw.lower())
             except Exception as e:
                 log.error("Row %d: send error — %s", row_num, e)
                 tracker.record(
@@ -585,13 +630,13 @@ def run(args):
     log.info("=" * 60)
     log.info(
         "Run complete — sent:%d  failed:%d  invalid:%d  "
-        "skipped:%d  resumed(already-sent):%d",
+        "skipped:%d  already-sent(skipped):%d",
         sent, failed, invalid, skipped, resumed,
     )
     if session_limit:
         log.info("Session limit: %d/%d used this run", session_sent, session_limit)
-    log.info("Text log  -> %s", tracker.log_path)
-    log.info("Excel log -> %s", tracker.xlsx_path)
+    log.info("Master log   -> %s", tracker.log_path)
+    log.info("Master Excel -> %s", tracker.xlsx_path)
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -601,7 +646,8 @@ def parse_args():
     )
     p.add_argument("--dataset",     required=True, help="Path to input Excel file")
     p.add_argument("--attachments", default="attachments", help="Dir containing PDFs")
-    p.add_argument("--output",      default="output",      help="Dir for result logs")
+    p.add_argument("--output",      default="output",
+                   help="Dir for the master results log (default: output)")
 
     # ── Graph / Azure AD auth ─────────────────────────────────────────────────
     p.add_argument("--tenant-id",     required=True,
@@ -618,8 +664,6 @@ def parse_args():
                    help="Seconds to pause between batches (default: 60)")
     p.add_argument("--send-delay",  type=int, default=3,
                    help="Seconds to pause between individual emails (default: 3)")
-    p.add_argument("--resume", nargs="+", metavar="LOG_FILE",
-                   help="Previous result .txt file(s) to skip already-sent emails")
     p.add_argument("--session-limit", type=int, default=None, metavar="N",
                    help="Stop after sending N emails this run")
     p.add_argument("--allow-missing-attachments", action="store_true",
