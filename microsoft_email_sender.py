@@ -10,13 +10,13 @@ Mail.Send permission — no admin consent required).
 Single master log
 -----------------
 Every run appends to ONE file: <output>/master_results.txt (plus an Excel
-view, master_results.xlsx, rebuilt at the end of each run). On startup the
-script reads the master file and skips anyone already marked "sent", so no
---resume argument is needed.
+view, master_results.xlsx). On startup the script reads the master file and
+skips anyone already marked "sent", so no --resume argument is needed.
 
-If the master file doesn't exist yet but old results_*.txt files are found in
-the output folder, their "sent" rows are merged into a new master automatically
-(one-time migration).
+If the master file exists, it is only appended to (never rewritten or migrated
+into). Only when NO master file is found, and old results_*.txt files exist in
+the output folder, are their "sent" rows merged into a new master (one-time).
+The Excel copy is likewise appended to if it exists, and built once if not.
 
 Setup
 -----
@@ -406,7 +406,17 @@ class ResultTracker:
         self.xlsx_path  = output_dir / f"{MASTER_LOG_NAME}.xlsx"
         self.records: list[dict] = []   # this run only (for the summary)
 
-        if not self.log_path.exists() or self.log_path.stat().st_size == 0:
+        if self.log_path.exists():
+            # Master detected -> never touch or rewrite it; just append later.
+            log.info("Master log found: %s — appending to it (no migration).",
+                     self.log_path.resolve())
+            if self.log_path.stat().st_size == 0:
+                # Exists but completely empty: add the header only.
+                with open(self.log_path, "w", encoding="utf-8") as f:
+                    f.write("\t".join(self.COLUMNS) + "\n")
+        else:
+            # No master detected -> this is the only time we migrate/create.
+            log.info("No master log at %s — creating it.", self.log_path.resolve())
             if not self._migrate_old_results():
                 with open(self.log_path, "w", encoding="utf-8") as f:
                     f.write("\t".join(self.COLUMNS) + "\n")
@@ -452,13 +462,32 @@ class ResultTracker:
             f.write(row + "\n")
 
     def save_excel(self):
-        """Rebuild the Excel view from the full master file (all runs)."""
+        """
+        Excel view of the master.
+        - If the .xlsx already exists: append only this run's rows to it.
+        - If it doesn't exist: build it once from the full master .txt.
+        """
         try:
-            df = pd.read_csv(self.log_path, sep="\t", dtype=str).fillna("")
-            df.to_excel(self.xlsx_path, index=False)
-            log.info("Excel master saved -> %s (%d total rows)", self.xlsx_path, len(df))
+            if self.xlsx_path.exists():
+                if not self.records:
+                    log.info("No new rows this run — Excel master left untouched.")
+                    return
+                from openpyxl import load_workbook
+                wb = load_workbook(self.xlsx_path)
+                ws = wb.active
+                for r in self.records:
+                    ws.append([str(r.get(c, "")) for c in self.COLUMNS])
+                wb.save(self.xlsx_path)
+                log.info("Appended %d rows to Excel master -> %s",
+                         len(self.records), self.xlsx_path)
+            else:
+                df = pd.read_csv(self.log_path, sep="\t", dtype=str).fillna("")
+                df.to_excel(self.xlsx_path, index=False)
+                log.info("Excel master created -> %s (%d rows)", self.xlsx_path, len(df))
         except PermissionError:
-            log.warning("Close %s in Excel, then rerun to refresh it.", self.xlsx_path)
+            log.warning("Close %s in Excel. The .txt master is up to date; "
+                        "this run's rows were NOT added to the Excel copy.",
+                        self.xlsx_path)
 
     def summary(self):
         counts: dict[str, int] = {}
